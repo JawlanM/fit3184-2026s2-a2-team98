@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "species": {
+    "fox":       { "synonyms": ["foxes", "red fox"],         "rekognition": ["Fox", "Red Fox"] },
+    "rabbit":    { "synonyms": ["rabbits", "bunny"],         "rekognition": ["Rabbit", "Hare"] },
+    "feral pig": { "synonyms": ["pig", "pigs", "boar", "wild boar"], "rekognition": ["Pig", "Hog", "Boar"] },
+    "cane toad": { "synonyms": ["toad", "toads", "cane toads"], "rekognition": ["Toad", "Frog"] },
+    "cat":       { "synonyms": ["cats", "kitten"],           "rekognition": ["Cat"] },
+    "dog":       { "synonyms": ["dogs", "puppy"],            "rekognition": ["Dog"] }
+  }
+}

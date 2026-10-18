@@ -20,3 +20,9 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Copied from config/labels.json by scripts/sync_labels.py (D-04)
+backend/layers/common/common/labels.json
+
+# Test output
+.pytest_cache/
