@@ -69,14 +69,27 @@ def _set_synced(row: dict, synced: bool) -> None:
 
 
 def _create(user: str, email: str, species: list[str]) -> dict:
-    arn = aws.sns().subscribe(
-        TopicArn=config.TOPIC_ARN, Protocol="email", Endpoint=email,
-        Attributes={"FilterPolicy": _filter(species), "FilterPolicyScope": "MessageAttributes"},
-        ReturnSubscriptionArn=True,          # the real ARN now, not "pending confirmation"
-    )["SubscriptionArn"]
+    sns = aws.sns()
+    try:
+        arn = sns.subscribe(
+            TopicArn=config.TOPIC_ARN, Protocol="email", Endpoint=email,
+            Attributes={"FilterPolicy": _filter(species), "FilterPolicyScope": "MessageAttributes"},
+            ReturnSubscriptionArn=True,      # the real ARN now, not "pending confirmation"
+        )["SubscriptionArn"]
+        synced = True
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidParameter":
+            raise
+        # SNS still holds an older subscription for this email with another filter
+        # (e.g. unsubscribed while pending). Take that one over and set our filter on it.
+        arn = sns.subscribe(TopicArn=config.TOPIC_ARN, Protocol="email", Endpoint=email,
+                            ReturnSubscriptionArn=True)["SubscriptionArn"]
+        synced = None
     row = {"userSub": user, "subscriptionArn": arn, "email": email, "species": set(species),
            "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "filterSynced": True}
+    if synced is None:
+        row["filterSynced"] = _apply_filter(row)
     _table().put_item(Item=row)
     return row
 
