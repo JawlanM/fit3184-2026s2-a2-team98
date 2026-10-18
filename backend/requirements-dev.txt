@@ -1,0 +1,4 @@
+-r layers/common/requirements.txt
+boto3
+moto[dynamodb,s3,sns]==5.2.4
+pytest==9.1.1
