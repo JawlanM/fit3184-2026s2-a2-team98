@@ -1,0 +1,585 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Aussie EcoGuard backend (AWS side). Owner of shared resources and A's Lambdas is A; B and C add their functions below.
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:5173
+    AllowedPattern: "^https?://[^*,\\s]+$"      # one origin, never "*", never a list (D-14)
+    Description: The one website allowed to call the API. localhost until 10-28, then the CloudFront URL.
+  WebAppUrl:
+    Type: String
+    Default: http://localhost:5173
+    Description: Base of the links in notification emails (<WebAppUrl>/files/<fileId>).
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [x86_64]
+    Timeout: 15
+    MemorySize: 512
+    Layers: [!Ref CommonLayer]
+    Environment:
+      Variables:
+        FILES_TABLE: !Ref FilesTable
+        TAG_INDEX_TABLE: !Ref TagIndexTable
+        SUBSCRIPTIONS_TABLE: !Ref SubscriptionsTable
+        MEDIA_BUCKET: !Ref MediaBucket
+        THUMBS_BUCKET: !Ref ThumbsBucket
+        TOPIC_ARN: !Ref SightingsTopic
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+        WEB_APP_URL: !Ref WebAppUrl
+
+Resources:
+
+  # ------------------------------------------------------------------ login (Cognito)
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: ecoguard-users
+      UsernameAttributes: [email]                 # users sign in with their email
+      AutoVerifiedAttributes: [email]             # Cognito emails a code before sign-in works
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+        - { Name: given_name, AttributeDataType: String, Required: true, Mutable: true }
+        - { Name: family_name, AttributeDataType: String, Required: true, Mutable: true }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7       # for users an admin creates
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false           # self sign-up allowed
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+
+  # The browser app (C). No secret: code in a browser can't keep one.
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: ecoguard-web
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH                     # Amplify's default sign-in
+        - ALLOW_USER_PASSWORD_AUTH                # Postman and scripts/smoke_test.py
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes, RefreshToken: days }
+
+  # Machine-to-machine login for B's tagging-dispatcher (no user present).
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "ecoguard-${AWS::AccountId}"   # token URL host; must be unique in the region
+
+  DetectResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: ecoguard
+      Name: EcoGuard inference
+      Scopes:
+        - { ScopeName: detect, ScopeDescription: Call POST /v1/detect on Cloud Run }
+
+  M2MClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: DetectResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: ecoguard-dispatcher-m2m
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes: [ecoguard/detect]
+      AccessTokenValidity: 60
+      TokenValidityUnits: { AccessToken: minutes }
+
+  M2MSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: ecoguard/m2m-client
+      Description: Client-credentials login for tagging-dispatcher -> Cloud Run
+      SecretString: !Sub
+        - '{"clientId":"${M2MClient}","clientSecret":"${Secret}","tokenUrl":"https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token","scope":"ecoguard/detect"}'
+        - Secret: !GetAtt M2MClient.ClientSecret
+
+  # ------------------------------------------------------------------ API Gateway
+
+  EcoGuardApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: ecoguard-api
+      StageName: prod
+      Auth:
+        DefaultAuthorizer: CognitoAuth            # every route needs a token (D-01, D-06)
+        AddDefaultAuthorizerToCorsPreflight: false # the browser's OPTIONS carries no token
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+      Cors:
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        MaxAge: "'600'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 25                 # requests/second, keeps a runaway loop cheap
+          ThrottlingBurstLimit: 50
+      # API Gateway's own errors, in the contract's shape and with CORS headers (D-06)
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"UNAUTHORIZED","message":$context.error.messageString}}'
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"FORBIDDEN","message":$context.error.messageString}}'
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"VALIDATION_ERROR","message":$context.error.messageString}}'
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Authorization,Content-Type'"
+          ResponseTemplates:
+            application/json: '{"error":{"code":"INTERNAL_ERROR","message":$context.error.messageString}}'
+
+  # ------------------------------------------------------------------ data
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EcoGuardFiles
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: fileId, AttributeType: S }
+        - { AttributeName: visibility, AttributeType: S }
+        - { AttributeName: uploadedAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: fileId, KeyType: HASH }
+      # No thumbnailUrl-index: the fileId is read from the URL instead (D-07).
+      GlobalSecondaryIndexes:
+        - IndexName: uploadedAt-index             # B's lost-pet search, C's date filters
+          KeySchema:
+            - { AttributeName: visibility, KeyType: HASH }
+            - { AttributeName: uploadedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES        # notifier compares before/after (D-02)
+
+  TagIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EcoGuardTagIndex
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: tag, AttributeType: S }
+        - { AttributeName: fileId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tag, KeyType: HASH }
+        - { AttributeName: fileId, KeyType: RANGE }
+
+  SubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EcoGuardSubscriptions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userSub, AttributeType: S }
+        - { AttributeName: subscriptionArn, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userSub, KeyType: HASH }
+        - { AttributeName: subscriptionArn, KeyType: RANGE }
+
+  # Bucket names are global across all AWS accounts, so the account ID is added (D-07).
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ecoguard-media-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:                          # the browser PUTs uploads straight to S3 (B)
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [PUT, GET]
+            AllowedHeaders: [Content-Type, x-amz-checksum-sha256, x-amz-sdk-checksum-algorithm]
+            MaxAge: 600
+
+  ThumbsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ecoguard-thumbs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [GET]
+            AllowedHeaders: ["Content-Type"]
+            MaxAge: 600
+
+  SightingsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecoguard-sightings
+      DisplayName: EcoGuard
+
+  # ------------------------------------------------------------------ shared code
+
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: ecoguard-common
+      ContentUri: build/layer/                    # made by scripts/build_layer.py (Linux wheels, D-15)
+      CompatibleRuntimes: [python3.11]
+      CompatibleArchitectures: [x86_64]
+
+  # ------------------------------------------------------------------ A's functions
+  # Pattern (D-12): own log group (14 days), own role, no SAM-managed policies.
+  # Giving `Role:` stops SAM attaching AWS-managed policies that use "*".
+
+  MeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-me, RetentionInDays: 14 }
+
+  MeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-me
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt MeLogGroup.Arn
+
+  MeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-me
+      CodeUri: functions/me/
+      Handler: app.handler
+      Role: !GetAtt MeRole.Arn
+      Events:
+        Me:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /me, Method: get }
+
+  QueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-query, RetentionInDays: 14 }
+
+  QueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-query
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt QueryLogGroup.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem]
+                Resource: !GetAtt FilesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource: !GetAtt TagIndexTable.Arn
+              - Effect: Allow                     # signs viewUrl links; never downloads
+                Action: [s3:GetObject]
+                Resource:
+                  - !Sub "arn:aws:s3:::${MediaBucket}/media/*"
+                  - !Sub "arn:aws:s3:::${ThumbsBucket}/thumbs/*"
+
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-query
+      CodeUri: functions/query/
+      Handler: app.handler
+      Role: !GetAtt QueryRole.Arn
+      Events:
+        Tags:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /query/tags, Method: post }
+        Species:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /query/species, Method: post }
+        Thumbnail:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /query/thumbnail, Method: post }
+
+  BulkTagLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-bulk-tag, RetentionInDays: 14 }
+
+  BulkTagRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-bulk-tag
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BulkTagLogGroup.Arn
+              # A transaction is checked action by action, so each write type is listed (D-12).
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt FilesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt TagIndexTable.Arn
+
+  BulkTagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-bulk-tag
+      CodeUri: functions/bulk_tag/
+      Handler: app.handler
+      Role: !GetAtt BulkTagRole.Arn
+      Timeout: 29                                 # up to 100 files; API Gateway's own limit is 29 s
+      Events:
+        BulkTag:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /tags/bulk, Method: post }
+
+  DeleteLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-delete, RetentionInDays: 14 }
+
+  DeleteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-delete
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt DeleteLogGroup.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:DeleteItem]
+                Resource: !GetAtt FilesTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:DeleteItem]
+                Resource: !GetAtt TagIndexTable.Arn
+              - Effect: Allow                     # DeleteObjects (batch) also uses this action
+                Action: [s3:DeleteObject]
+                Resource:
+                  - !Sub "arn:aws:s3:::${MediaBucket}/media/*"
+                  - !Sub "arn:aws:s3:::${ThumbsBucket}/thumbs/*"
+
+  DeleteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-delete
+      CodeUri: functions/delete/
+      Handler: app.handler
+      Role: !GetAtt DeleteRole.Arn
+      Timeout: 29
+      Events:
+        Delete:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /files/delete, Method: post }
+
+  SubscriptionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-subscriptions, RetentionInDays: 14 }
+
+  SubscriptionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-subscriptions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SubscriptionsLogGroup.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt SubscriptionsTable.Arn
+              # Subscription ARNs are "<topic ARN>:<uuid>", so both forms are listed.
+              - Effect: Allow
+                Action: [sns:Subscribe, sns:Unsubscribe,
+                         sns:GetSubscriptionAttributes, sns:SetSubscriptionAttributes]
+                Resource:
+                  - !Ref SightingsTopic
+                  - !Sub "${SightingsTopic}:*"
+
+  SubscriptionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-subscriptions
+      CodeUri: functions/subscriptions/
+      Handler: app.handler
+      Role: !GetAtt SubscriptionsRole.Arn
+      Events:
+        Create:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /subscriptions, Method: post }
+        List:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: /subscriptions, Method: get }
+        Remove:
+          Type: Api
+          Properties: { RestApiId: !Ref EcoGuardApi, Path: "/subscriptions/{id}", Method: delete }
+
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/ecoguard-notifier, RetentionInDays: 14 }
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: ecoguard-notifier
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt NotifierLogGroup.Arn
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator]
+                Resource: !GetAtt FilesTable.StreamArn
+              - Effect: Allow                     # AWS accepts only "*" for this one action (D-12)
+                Action: [dynamodb:ListStreams]
+                Resource: "*"
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref SightingsTopic
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoguard-notifier
+      CodeUri: functions/notifier/
+      Handler: app.handler
+      Role: !GetAtt NotifierRole.Arn
+      Events:
+        FilesStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt FilesTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 2
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            FilterCriteria:                       # AWS drops non-ready records before calling us
+              Filters:
+                - Pattern: '{"eventName": ["INSERT", "MODIFY"], "dynamodb": {"NewImage": {"status": {"S": ["ready"]}}}}'
+
+  # ------------------------------------------------------------------ B's functions
+  # presign, files-get, thumbnail, tagging-dispatcher, by-file, lost-pet go here.
+  # Copy the log group + role + function pattern above. The dispatcher reads
+  # M2MSecret: add secretsmanager:GetSecretValue on !Ref M2MSecret to its role.
+
+  # ------------------------------------------------------------------ C's functions
+  # chat, lex-fulfilment go here (same pattern).
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for every endpoint
+    Value: !Sub "https://${EcoGuardApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  Region:
+    Value: !Ref AWS::Region
+  UserPoolId:
+    Value: !Ref UserPool
+  WebClientId:
+    Description: Amplify Auth userPoolClientId for the frontend
+    Value: !Ref WebClient
+  CognitoIssuer:
+    Description: JWT "iss" that Cloud Run checks; JWKS is <issuer>/.well-known/jwks.json
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+  M2MClientId:
+    Value: !Ref M2MClient
+  M2MSecretArn:
+    Description: clientId, clientSecret, tokenUrl and scope for the dispatcher
+    Value: !Ref M2MSecret
+  TokenUrl:
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  ThumbsBucketName:
+    Value: !Ref ThumbsBucket
+  FilesTableName:
+    Value: !Ref FilesTable
+  FilesStreamArn:
+    Value: !GetAtt FilesTable.StreamArn
+  TagIndexTableName:
+    Value: !Ref TagIndexTable
+  SightingsTopicArn:
+    Value: !Ref SightingsTopic
+  CommonLayerArn:
+    Value: !Ref CommonLayer

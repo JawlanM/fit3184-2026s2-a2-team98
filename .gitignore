@@ -1,5 +1,6 @@
 # SAM / Python
 .aws-sam/
+backend/build/
 __pycache__/
 *.pyc
 .venv/
